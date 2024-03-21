@@ -74,9 +74,7 @@ on early-init
     # become available. Note that this is executed as exec_start to ensure that
     # the libraries are available to the processes started after this statement.
     exec_start apexd-bootstrap
-
-    # Generate linker config based on apex mounted in bootstrap namespace
-    update_linker_config
+    perform_apex_config --bootstrap
 
     # These must already exist by the time boringssl_self_test32 / boringssl_self_test64 run.
     mkdir /dev/boringssl 0755 root root
@@ -483,14 +481,7 @@ on init
     start vndservicemanager
 
 # Run boringssl self test for each ABI.  Any failures trigger reboot to firmware.
-on init && property:ro.product.cpu.abilist32=*
-    exec_start boringssl_self_test32
-on init && property:ro.product.cpu.abilist64=*
-    exec_start boringssl_self_test64
-on property:apexd.status=ready && property:ro.product.cpu.abilist32=*
-    exec_start boringssl_self_test_apex32
-on property:apexd.status=ready && property:ro.product.cpu.abilist64=*
-    exec_start boringssl_self_test_apex64
+import /system/etc/init/hw/init.boringssl.${ro.zygote}.rc
 
 service boringssl_self_test32 /system/bin/boringssl_self_test32
     reboot_on_failure reboot,boringssl-self-check-failed
@@ -555,7 +546,7 @@ on late-init
     # Should be before netd, but after apex, properties and logging is available.
     trigger load_bpf_programs
 
-    # Now we can start zygote for devices with file based encryption
+    # Now we can start zygote.
     trigger zygote-start
 
     # Remove a file to wake up anything waiting for firmware.
@@ -626,8 +617,8 @@ on post-fs
     chmod 0700 /metadata/vold
     mkdir /metadata/password_slots 0771 root system
     mkdir /metadata/bootstat 0750 system log
-    mkdir /metadata/ota 0700 root system
-    mkdir /metadata/ota/snapshots 0700 root system
+    mkdir /metadata/ota 0750 root system
+    mkdir /metadata/ota/snapshots 0750 root system
     mkdir /metadata/userspacereboot 0770 root system
     mkdir /metadata/watchdog 0770 root system
 
@@ -641,7 +632,6 @@ on post-fs
     restorecon_recursive /metadata/apex
 
     mkdir /metadata/staged-install 0770 root system
-    mkdir /metadata/sepolicy 0700 root root
 on late-fs
     # Ensure that tracefs has the correct permissions.
     # This does not work correctly if it is called in post-fs.
@@ -941,15 +931,22 @@ on post-fs-data
     # encryption policies apply recursively.  These directories should never
     # contain any subdirectories other than the per-user ones.  /data/media/obb
     # is an exception that exists for legacy reasons.
-    mkdir /data/media 0770 media_rw media_rw encryption=None
-    mkdir /data/misc_ce 01771 system misc encryption=None
-    mkdir /data/misc_de 01771 system misc encryption=None
-    mkdir /data/system_ce 0770 system system encryption=None
-    mkdir /data/system_de 0770 system system encryption=None
-    mkdir /data/user 0711 system system encryption=None
-    mkdir /data/user_de 0711 system system encryption=None
-    mkdir /data/vendor_ce 0771 root root encryption=None
-    mkdir /data/vendor_de 0771 root root encryption=None
+    #
+    # Don't use any write mode bits (0222) for any of these directories, since
+    # the only process that should write to them directly is vold (since it
+    # needs to set up file-based encryption on the subdirectories), which runs
+    # as root with CAP_DAC_OVERRIDE.  This is also fully enforced via the
+    # SELinux policy.  But we also set the DAC file modes accordingly, to try to
+    # minimize differences in behavior if SELinux is set to permissive mode.
+    mkdir /data/media 0550 media_rw media_rw encryption=None
+    mkdir /data/misc_ce 0551 system misc encryption=None
+    mkdir /data/misc_de 0551 system misc encryption=None
+    mkdir /data/system_ce 0550 system system encryption=None
+    mkdir /data/system_de 0550 system system encryption=None
+    mkdir /data/user 0511 system system encryption=None
+    mkdir /data/user_de 0511 system system encryption=None
+    mkdir /data/vendor_ce 0551 root root encryption=None
+    mkdir /data/vendor_de 0551 root root encryption=None
 
     # Set the casefold flag on /data/media.  For upgrades, a restorecon can be
     # needed first to relabel the directory from media_rw_data_file.
@@ -1012,7 +1009,7 @@ on post-fs-data
     perform_apex_config
 
     # Create directories for boot animation.
-    mkdir /data/bootanim 0755 system system encryption=DeleteIfNecessary
+    mkdir /data/misc/bootanim 0755 system system encryption=DeleteIfNecessary
 
     exec_start derive_sdk
 
@@ -1036,12 +1033,8 @@ on post-fs-data
     # Must start after 'derive_classpath' to have *CLASSPATH variables set.
     start odsign
 
-    # Before we can lock keys and proceed to the next boot stage, wait for
-    # odsign to be done with the key
+    # Wait for odsign to be done with the key.
     wait_for_prop odsign.key.done 1
-
-    # Lock the fs-verity keyring, so no more keys can be added
-    exec -- /system/bin/fsverity_init --lock
 
     # Bump the boot level to 1000000000; this prevents further on-device signing.
     # This is a special value that shuts down the thread which listens for
@@ -1071,26 +1064,11 @@ on post-fs-data
 
 # It is recommended to put unnecessary data/ initialization from post-fs-data
 # to start-zygote in device's init.rc to unblock zygote start.
-on zygote-start && property:ro.crypto.state=unencrypted
+on zygote-start
     wait_for_prop odsign.verification.done 1
     # A/B update verifier that marks a successful boot.
-    exec_start update_verifier_nonencrypted
-    start netd
-    start zygote
-    start zygote_secondary
-
-on zygote-start && property:ro.crypto.state=unsupported
-    wait_for_prop odsign.verification.done 1
-    # A/B update verifier that marks a successful boot.
-    exec_start update_verifier_nonencrypted
-    start netd
-    start zygote
-    start zygote_secondary
-
-on zygote-start && property:ro.crypto.state=encrypted && property:ro.crypto.type=file
-    wait_for_prop odsign.verification.done 1
-    # A/B update verifier that marks a successful boot.
-    exec_start update_verifier_nonencrypted
+    exec_start update_verifier
+    start statsd
     start netd
     start zygote
     start zygote_secondary
@@ -1098,6 +1076,9 @@ on zygote-start && property:ro.crypto.state=encrypted && property:ro.crypto.type
 # Tweak background writeout
 on boot && property:ro.config.low_ram=true
     write /proc/sys/vm/dirty_expire_centisecs 200
+
+on boot && property:suspend.disable_sync_on_suspend=true
+    write /sys/power/sync_on_suspend 0
 
 on boot
     # basic network init

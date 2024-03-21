@@ -129,7 +129,7 @@ bool CgroupGetAttributePathForTask(const std::string& attr_name, int tid, std::s
     }
 
     if (!attr->GetPathForTask(tid, path)) {
-        PLOG(ERROR) << "Failed to find cgroup for tid " << tid;
+        LOG(ERROR) << "Failed to find cgroup for tid " << tid;
         return false;
     }
 
@@ -206,28 +206,43 @@ bool SetUserProfiles(uid_t uid, const std::vector<std::string>& profiles) {
 }
 
 static std::string ConvertUidToPath(const char* cgroup, uid_t uid) {
-    return StringPrintf("%s/uid_%d", cgroup, uid);
+    return StringPrintf("%s/uid_%u", cgroup, uid);
 }
 
 static std::string ConvertUidPidToPath(const char* cgroup, uid_t uid, int pid) {
-    return StringPrintf("%s/uid_%d/pid_%d", cgroup, uid, pid);
+    return StringPrintf("%s/uid_%u/pid_%d", cgroup, uid, pid);
 }
 
-static int RemoveProcessGroup(const char* cgroup, uid_t uid, int pid, unsigned int retries) {
+static int RemoveCgroup(const char* cgroup, uid_t uid, int pid, unsigned int retries) {
     int ret = 0;
     auto uid_pid_path = ConvertUidPidToPath(cgroup, uid, pid);
-    auto uid_path = ConvertUidToPath(cgroup, uid);
 
     while (retries--) {
         ret = rmdir(uid_pid_path.c_str());
-        if (!ret || errno != EBUSY) break;
+        // If we get an error 2 'No such file or directory' , that means the
+        // cgroup is already removed, treat it as success and return 0 for
+        // idempotency.
+        if (ret < 0 && errno == ENOENT) {
+            ret = 0;
+        }
+        if (!ret || errno != EBUSY || !retries) break;
         std::this_thread::sleep_for(5ms);
+    }
+
+    if (!ret && uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END) {
+        // Isolated UIDs are unlikely to be reused soon after removal,
+        // so free up the kernel resources for the UID level cgroup.
+        const auto uid_path = ConvertUidToPath(cgroup, uid);
+        ret = rmdir(uid_path.c_str());
+        if (ret < 0 && errno == ENOENT) {
+            ret = 0;
+        }
     }
 
     return ret;
 }
 
-static bool RemoveUidProcessGroups(const std::string& uid_path, bool empty_only) {
+static bool RemoveEmptyUidCgroups(const std::string& uid_path) {
     std::unique_ptr<DIR, decltype(&closedir)> uid(opendir(uid_path.c_str()), closedir);
     bool empty = true;
     if (uid != NULL) {
@@ -242,21 +257,6 @@ static bool RemoveUidProcessGroups(const std::string& uid_path, bool empty_only)
             }
 
             auto path = StringPrintf("%s/%s", uid_path.c_str(), dir->d_name);
-            if (empty_only) {
-                struct stat st;
-                auto procs_file = StringPrintf("%s/%s", path.c_str(),
-                                               PROCESSGROUP_CGROUP_PROCS_FILE);
-                if (stat(procs_file.c_str(), &st) == -1) {
-                    PLOG(ERROR) << "Failed to get stats for " << procs_file;
-                    continue;
-                }
-                if (st.st_size > 0) {
-                    // skip non-empty groups
-                    LOG(VERBOSE) << "Skipping non-empty group " << path;
-                    empty = false;
-                    continue;
-                }
-            }
             LOG(VERBOSE) << "Removing " << path;
             if (rmdir(path.c_str()) == -1) {
                 if (errno != EBUSY) {
@@ -269,11 +269,13 @@ static bool RemoveUidProcessGroups(const std::string& uid_path, bool empty_only)
     return empty;
 }
 
-void removeAllProcessGroupsInternal(bool empty_only) {
+void removeAllEmptyProcessGroups() {
+    LOG(VERBOSE) << "removeAllEmptyProcessGroups()";
+
     std::vector<std::string> cgroups;
     std::string path, memcg_apps_path;
 
-    if (CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &path)) {
+    if (CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &path)) {
         cgroups.push_back(path);
     }
     if (CgroupGetMemcgAppsPath(&memcg_apps_path) && memcg_apps_path != path) {
@@ -296,7 +298,7 @@ void removeAllProcessGroupsInternal(bool empty_only) {
                 }
 
                 auto path = StringPrintf("%s/%s", cgroup_root_path.c_str(), dir->d_name);
-                if (!RemoveUidProcessGroups(path, empty_only)) {
+                if (!RemoveEmptyUidCgroups(path)) {
                     LOG(VERBOSE) << "Skip removing " << path;
                     continue;
                 }
@@ -307,16 +309,6 @@ void removeAllProcessGroupsInternal(bool empty_only) {
             }
         }
     }
-}
-
-void removeAllProcessGroups() {
-    LOG(VERBOSE) << "removeAllProcessGroups()";
-    removeAllProcessGroupsInternal(false);
-}
-
-void removeAllEmptyProcessGroups() {
-    LOG(VERBOSE) << "removeAllEmptyProcessGroups()";
-    removeAllProcessGroupsInternal(true);
 }
 
 /**
@@ -386,8 +378,11 @@ static int DoKillProcessGroupOnce(const char* cgroup, uid_t uid, int initialPid,
         fd.reset(fopen(path.c_str(), "re"));
         if (!fd) {
             if (errno == ENOENT) {
-                // This happens when process is already dead
-                return 0;
+                // This happens when the process is already dead or if, as the result of a bug, it
+                // has been migrated to another cgroup. An example of a bug that can cause migration
+                // to another cgroup is using the JoinCgroup action with a cgroup controller that
+                // has been activated in the v2 cgroup hierarchy.
+                goto kill;
             }
             PLOG(WARNING) << __func__ << " failed to open process cgroup uid " << uid << " pid "
                           << initialPid;
@@ -426,6 +421,7 @@ static int DoKillProcessGroupOnce(const char* cgroup, uid_t uid, int initialPid,
         }
     }
 
+kill:
     // Kill all process groups.
     for (const auto pgid : pgids) {
         LOG(VERBOSE) << "Killing process group " << -pgid << " in uid " << uid
@@ -449,29 +445,21 @@ static int DoKillProcessGroupOnce(const char* cgroup, uid_t uid, int initialPid,
     return (!fd || feof(fd.get())) ? processes : -1;
 }
 
-static int KillProcessGroup(uid_t uid, int initialPid, int signal, int retries,
-                            int* max_processes) {
+static int KillProcessGroup(uid_t uid, int initialPid, int signal, int retries) {
     CHECK_GE(uid, 0);
     CHECK_GT(initialPid, 0);
 
     std::string hierarchy_root_path;
     if (CgroupsAvailable()) {
-        CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &hierarchy_root_path);
+        CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &hierarchy_root_path);
     }
     const char* cgroup = hierarchy_root_path.c_str();
 
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 
-    if (max_processes != nullptr) {
-        *max_processes = 0;
-    }
-
     int retry = retries;
     int processes;
     while ((processes = DoKillProcessGroupOnce(cgroup, uid, initialPid, signal)) > 0) {
-        if (max_processes != nullptr && processes > *max_processes) {
-            *max_processes = processes;
-        }
         LOG(VERBOSE) << "Killed " << processes << " processes for processgroup " << initialPid;
         if (!CgroupsAvailable()) {
             // makes no sense to retry, because there are no cgroup_procs file
@@ -513,12 +501,12 @@ static int KillProcessGroup(uid_t uid, int initialPid, int signal, int retries,
         }
 
         // 400 retries correspond to 2 secs max timeout
-        int err = RemoveProcessGroup(cgroup, uid, initialPid, 400);
+        int err = RemoveCgroup(cgroup, uid, initialPid, 400);
 
         if (isMemoryCgroupSupported() && UsePerAppMemcg()) {
             std::string memcg_apps_path;
             if (CgroupGetMemcgAppsPath(&memcg_apps_path) &&
-                RemoveProcessGroup(memcg_apps_path.c_str(), uid, initialPid, 400) < 0) {
+                RemoveCgroup(memcg_apps_path.c_str(), uid, initialPid, 400) < 0) {
                 return -1;
             }
         }
@@ -534,18 +522,18 @@ static int KillProcessGroup(uid_t uid, int initialPid, int signal, int retries,
     }
 }
 
-int killProcessGroup(uid_t uid, int initialPid, int signal, int* max_processes) {
-    return KillProcessGroup(uid, initialPid, signal, 40 /*retries*/, max_processes);
+int killProcessGroup(uid_t uid, int initialPid, int signal) {
+    return KillProcessGroup(uid, initialPid, signal, 40 /*retries*/);
 }
 
-int killProcessGroupOnce(uid_t uid, int initialPid, int signal, int* max_processes) {
-    return KillProcessGroup(uid, initialPid, signal, 0 /*retries*/, max_processes);
+int killProcessGroupOnce(uid_t uid, int initialPid, int signal) {
+    return KillProcessGroup(uid, initialPid, signal, 0 /*retries*/);
 }
 
 int sendSignalToProcessGroup(uid_t uid, int initialPid, int signal) {
     std::string hierarchy_root_path;
     if (CgroupsAvailable()) {
-        CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &hierarchy_root_path);
+        CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &hierarchy_root_path);
     }
     const char* cgroup = hierarchy_root_path.c_str();
     return DoKillProcessGroupOnce(cgroup, uid, initialPid, signal);
@@ -603,7 +591,7 @@ int createProcessGroup(uid_t uid, int initialPid, bool memControl) {
     CHECK_GT(initialPid, 0);
 
     if (memControl && !UsePerAppMemcg()) {
-        PLOG(ERROR) << "service memory controls are used without per-process memory cgroup support";
+        LOG(ERROR) << "service memory controls are used without per-process memory cgroup support";
         return -EINVAL;
     }
 
@@ -619,19 +607,19 @@ int createProcessGroup(uid_t uid, int initialPid, bool memControl) {
     }
 
     std::string cgroup;
-    CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &cgroup);
+    CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &cgroup);
     return createProcessGroupInternal(uid, initialPid, cgroup, true);
 }
 
 static bool SetProcessGroupValue(int tid, const std::string& attr_name, int64_t value) {
     if (!isMemoryCgroupSupported()) {
-        PLOG(ERROR) << "Memcg is not mounted.";
+        LOG(ERROR) << "Memcg is not mounted.";
         return false;
     }
 
     std::string path;
     if (!CgroupGetAttributePathForTask(attr_name, tid, &path)) {
-        PLOG(ERROR) << "Failed to find attribute '" << attr_name << "'";
+        LOG(ERROR) << "Failed to find attribute '" << attr_name << "'";
         return false;
     }
 

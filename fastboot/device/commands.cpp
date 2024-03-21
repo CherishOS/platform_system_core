@@ -134,6 +134,7 @@ const std::unordered_map<std::string, VariableHandlers> kVariableMap = {
         {FB_VAR_IS_FORCE_DEBUGGABLE, {GetIsForceDebuggable, nullptr}},
         {FB_VAR_OFF_MODE_CHARGE_STATE, {GetOffModeChargeState, nullptr}},
         {FB_VAR_BATTERY_VOLTAGE, {GetBatteryVoltage, nullptr}},
+        {FB_VAR_BATTERY_SOC, {GetBatterySoC, nullptr}},
         {FB_VAR_BATTERY_SOC_OK, {GetBatterySoCOk, nullptr}},
         {FB_VAR_HW_REVISION, {GetHardwareRevision, nullptr}},
         {FB_VAR_SUPER_PARTITION_NAME, {GetSuperPartitionName, nullptr}},
@@ -146,6 +147,8 @@ const std::unordered_map<std::string, VariableHandlers> kVariableMap = {
         {FB_VAR_SECURITY_PATCH_LEVEL, {GetSecurityPatchLevel, nullptr}},
         {FB_VAR_TREBLE_ENABLED, {GetTrebleEnabled, nullptr}},
         {FB_VAR_MAX_FETCH_SIZE, {GetMaxFetchSize, nullptr}},
+        {FB_VAR_BATTERY_SERIAL_NUMBER, {GetBatterySerialNumber, nullptr}},
+        {FB_VAR_BATTERY_PART_STATUS, {GetBatteryPartStatus, nullptr}},
 };
 
 static bool GetVarAll(FastbootDevice* device) {

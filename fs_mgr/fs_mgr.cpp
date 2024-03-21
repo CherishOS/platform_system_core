@@ -613,7 +613,6 @@ static void tune_metadata_csum(const std::string& blk_device, const FstabEntry& 
 
 // Read the primary superblock from an f2fs filesystem.  On failure return
 // false.  If it's not an f2fs filesystem, also set FS_STAT_INVALID_MAGIC.
-#define F2FS_BLKSIZE 4096
 #define F2FS_SUPER_OFFSET 1024
 static bool read_f2fs_superblock(const std::string& blk_device, int* fs_stat) {
     android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(blk_device.c_str(), O_RDONLY | O_CLOEXEC)));
@@ -628,7 +627,9 @@ static bool read_f2fs_superblock(const std::string& blk_device, int* fs_stat) {
         PERROR << "Can't read '" << blk_device << "' superblock1";
         return false;
     }
-    if (TEMP_FAILURE_RETRY(pread(fd, &sb2, sizeof(sb2), F2FS_BLKSIZE + F2FS_SUPER_OFFSET)) !=
+    // F2FS only supports block_size=page_size case. So, it is safe to call
+    // `getpagesize()` and use that as size of super block.
+    if (TEMP_FAILURE_RETRY(pread(fd, &sb2, sizeof(sb2), getpagesize() + F2FS_SUPER_OFFSET)) !=
         sizeof(sb2)) {
         PERROR << "Can't read '" << blk_device << "' superblock2";
         return false;
@@ -652,7 +653,7 @@ bool fs_mgr_is_f2fs(const std::string& blk_device) {
         return false;
     }
     if (sb == cpu_to_le32(F2FS_SUPER_MAGIC)) return true;
-    if (TEMP_FAILURE_RETRY(pread(fd, &sb, sizeof(sb), F2FS_BLKSIZE + F2FS_SUPER_OFFSET)) !=
+    if (TEMP_FAILURE_RETRY(pread(fd, &sb, sizeof(sb), getpagesize() + F2FS_SUPER_OFFSET)) !=
         sizeof(sb)) {
         return false;
     }
@@ -850,7 +851,14 @@ static int __mount(const std::string& source, const std::string& target, const F
                   << ",type=" << entry.fs_type << ", gc_allowance=" << gc_allowance << "%)=" << ret
                   << "(" << save_errno << ")";
         }
-        ret = mount(source.c_str(), target.c_str(), entry.fs_type.c_str(), mountflags,
+
+        // Let's get the raw dm target, if it's a symlink, since some existing applications
+        // rely on /proc/mounts to find the userdata's dm target path. Don't break that assumption.
+        std::string real_source;
+        if (!android::base::Realpath(source, &real_source)) {
+            real_source = source;
+        }
+        ret = mount(real_source.c_str(), target.c_str(), entry.fs_type.c_str(), mountflags,
                     opts.c_str());
         save_errno = errno;
         if (try_f2fs_gc_allowance) gc_allowance += 10;
@@ -1121,8 +1129,11 @@ static bool SupportsCheckpoint(FstabEntry* entry) {
 
 class CheckpointManager {
   public:
-    CheckpointManager(int needs_checkpoint = -1, bool metadata_encrypted = false)
-        : needs_checkpoint_(needs_checkpoint), metadata_encrypted_(metadata_encrypted) {}
+    CheckpointManager(int needs_checkpoint = -1, bool metadata_encrypted = false,
+                      bool needs_encrypt = false)
+        : needs_checkpoint_(needs_checkpoint),
+          metadata_encrypted_(metadata_encrypted),
+          needs_encrypt_(needs_encrypt) {}
 
     bool NeedsCheckpoint() {
         if (needs_checkpoint_ != UNKNOWN) {
@@ -1185,7 +1196,7 @@ class CheckpointManager {
             } else {
                 LERROR << entry->fs_type << " does not implement checkpoints.";
             }
-        } else if (entry->fs_mgr_flags.checkpoint_blk) {
+        } else if (entry->fs_mgr_flags.checkpoint_blk && !needs_encrypt_) {
             auto actual_block_device = block_device.empty() ? entry->blk_device : block_device;
             if (fs_mgr_find_bow_device(actual_block_device).empty()) {
                 unique_fd fd(
@@ -1253,21 +1264,32 @@ class CheckpointManager {
     enum { UNKNOWN = -1, NO = 0, YES = 1 };
     int needs_checkpoint_;
     bool metadata_encrypted_;
+    bool needs_encrypt_;
     std::map<std::string, std::string> device_map_;
 };
 
 std::string fs_mgr_find_bow_device(const std::string& block_device) {
-    if (block_device.substr(0, 5) != "/dev/") {
-        LOG(ERROR) << "Expected block device, got " << block_device;
-        return std::string();
+    // handle symlink such as "/dev/block/mapper/userdata"
+    std::string real_path;
+    if (!android::base::Realpath(block_device, &real_path)) {
+        real_path = block_device;
     }
 
-    std::string sys_dir = std::string("/sys/") + block_device.substr(5);
-
+    struct stat st;
+    if (stat(real_path.c_str(), &st) < 0) {
+        PLOG(ERROR) << "stat failed: " << real_path;
+        return std::string();
+    }
+    if (!S_ISBLK(st.st_mode)) {
+        PLOG(ERROR) << real_path << " is not block device";
+        return std::string();
+    }
+    std::string sys_dir = android::base::StringPrintf("/sys/dev/block/%u:%u", major(st.st_rdev),
+                                                      minor(st.st_rdev));
     for (;;) {
         std::string name;
         if (!android::base::ReadFileToString(sys_dir + "/dm/name", &name)) {
-            PLOG(ERROR) << block_device << " is not dm device";
+            PLOG(ERROR) << real_path << " is not dm device";
             return std::string();
         }
 
@@ -1401,6 +1423,8 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
         return {FS_MGR_MNTALL_FAIL, userdata_mounted};
     }
 
+    bool scratch_can_be_mounted = true;
+
     // Keep i int to prevent unsigned integer overflow from (i = top_idx - 1),
     // where top_idx is 0. It will give SIGABRT
     for (int i = 0; i < static_cast<int>(fstab->size()); i++) {
@@ -1533,6 +1557,9 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
             if (current_entry.mount_point == "/data") {
                 userdata_mounted = true;
             }
+
+            MountOverlayfs(attempted_entry, &scratch_can_be_mounted);
+
             // Success!  Go get the next one.
             continue;
         }
@@ -1616,10 +1643,6 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     }
 
     set_type_property(encryptable);
-
-#if ALLOW_ADBD_DISABLE_VERITY == 1  // "userdebug" build
-    fs_mgr_overlayfs_mount_all(fstab);
-#endif
 
     if (error_count) {
         return {FS_MGR_MNTALL_FAIL, userdata_mounted};
@@ -1870,17 +1893,14 @@ int fs_mgr_do_mount_one(const FstabEntry& entry, const std::string& alt_mount_po
     return ret;
 }
 
-// If tmp_mount_point is non-null, mount the filesystem there.  This is for the
-// tmp mount we do to check the user password
 // If multiple fstab entries are to be mounted on "n_name", it will try to mount each one
 // in turn, and stop on 1st success, or no more match.
-static int fs_mgr_do_mount_helper(Fstab* fstab, const std::string& n_name,
-                                  const std::string& n_blk_device, const char* tmp_mount_point,
-                                  int needs_checkpoint, bool metadata_encrypted) {
+int fs_mgr_do_mount(Fstab* fstab, const std::string& n_name, const std::string& n_blk_device,
+                    int needs_checkpoint, bool needs_encrypt) {
     int mount_errors = 0;
     int first_mount_errno = 0;
     std::string mount_point;
-    CheckpointManager checkpoint_manager(needs_checkpoint, metadata_encrypted);
+    CheckpointManager checkpoint_manager(needs_checkpoint, true, needs_encrypt);
     AvbUniquePtr avb_handle(nullptr);
 
     if (!fstab) {
@@ -1922,11 +1942,7 @@ static int fs_mgr_do_mount_helper(Fstab* fstab, const std::string& n_name,
         }
 
         // Now mount it where requested */
-        if (tmp_mount_point) {
-            mount_point = tmp_mount_point;
-        } else {
-            mount_point = fstab_entry.mount_point;
-        }
+        mount_point = fstab_entry.mount_point;
 
         int fs_stat = prepare_fs_for_mount(n_blk_device, fstab_entry, mount_point);
 
@@ -1981,35 +1997,6 @@ static int fs_mgr_do_mount_helper(Fstab* fstab, const std::string& n_name,
         LERROR << "Cannot find mount point " << n_name << " in fstab";
     }
     return FS_MGR_DOMNT_FAILED;
-}
-
-int fs_mgr_do_mount(Fstab* fstab, const char* n_name, char* n_blk_device, char* tmp_mount_point) {
-    return fs_mgr_do_mount_helper(fstab, n_name, n_blk_device, tmp_mount_point, -1, false);
-}
-
-int fs_mgr_do_mount(Fstab* fstab, const char* n_name, char* n_blk_device, char* tmp_mount_point,
-                    bool needs_checkpoint, bool metadata_encrypted) {
-    return fs_mgr_do_mount_helper(fstab, n_name, n_blk_device, tmp_mount_point, needs_checkpoint,
-                                  metadata_encrypted);
-}
-
-/*
- * mount a tmpfs filesystem at the given point.
- * return 0 on success, non-zero on failure.
- */
-int fs_mgr_do_tmpfs_mount(const char *n_name)
-{
-    int ret;
-
-    ret = mount("tmpfs", n_name, "tmpfs", MS_NOATIME | MS_NOSUID | MS_NODEV | MS_NOEXEC,
-                CRYPTO_TMPFS_OPTIONS);
-    if (ret < 0) {
-        LERROR << "Cannot mount tmpfs filesystem at " << n_name;
-        return -1;
-    }
-
-    /* Success */
-    return 0;
 }
 
 static bool ConfigureIoScheduler(const std::string& device_path) {
@@ -2283,8 +2270,8 @@ bool fs_mgr_create_canonical_mount_point(const std::string& mount_point) {
 }
 
 bool fs_mgr_mount_overlayfs_fstab_entry(const FstabEntry& entry) {
-    auto overlayfs_valid_result = fs_mgr_overlayfs_valid();
-    if (overlayfs_valid_result == OverlayfsValidResult::kNotSupported) {
+    const auto overlayfs_check_result = android::fs_mgr::CheckOverlayfs();
+    if (!overlayfs_check_result.supported) {
         LERROR << __FUNCTION__ << "(): kernel does not support overlayfs";
         return false;
     }
@@ -2336,10 +2323,7 @@ bool fs_mgr_mount_overlayfs_fstab_entry(const FstabEntry& entry) {
         }
     }
 
-    auto options = "lowerdir=" + lowerdir;
-    if (overlayfs_valid_result == OverlayfsValidResult::kOverrideCredsRequired) {
-        options += ",override_creds=off";
-    }
+    const auto options = "lowerdir=" + lowerdir + overlayfs_check_result.mount_flags;
 
     // Use "overlay-" + entry.blk_device as the mount() source, so that adb-remout-test don't
     // confuse this with adb remount overlay, whose device name is "overlay".
@@ -2395,30 +2379,34 @@ std::string fs_mgr_get_context(const std::string& mount_point) {
     return context;
 }
 
-OverlayfsValidResult fs_mgr_overlayfs_valid() {
-    // Overlayfs available in the kernel, and patched for override_creds?
-    if (access("/sys/module/overlay/parameters/override_creds", F_OK) == 0) {
-        return OverlayfsValidResult::kOverrideCredsRequired;
-    }
+namespace android {
+namespace fs_mgr {
+
+OverlayfsCheckResult CheckOverlayfs() {
     if (!fs_mgr_filesystem_available("overlay")) {
-        return OverlayfsValidResult::kNotSupported;
+        return {.supported = false};
     }
     struct utsname uts;
     if (uname(&uts) == -1) {
-        return OverlayfsValidResult::kNotSupported;
+        return {.supported = false};
     }
     int major, minor;
     if (sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
-        return OverlayfsValidResult::kNotSupported;
+        return {.supported = false};
     }
-    if (major < 4) {
-        return OverlayfsValidResult::kOk;
+    // Overlayfs available in the kernel, and patched for override_creds?
+    if (access("/sys/module/overlay/parameters/override_creds", F_OK) == 0) {
+        auto mount_flags = ",override_creds=off"s;
+        if (major > 5 || (major == 5 && minor >= 15)) {
+            mount_flags += ",userxattr"s;
+        }
+        return {.supported = true, .mount_flags = mount_flags};
     }
-    if (major > 4) {
-        return OverlayfsValidResult::kNotSupported;
+    if (major < 4 || (major == 4 && minor <= 3)) {
+        return {.supported = true};
     }
-    if (minor > 3) {
-        return OverlayfsValidResult::kNotSupported;
-    }
-    return OverlayfsValidResult::kOk;
+    return {.supported = false};
 }
+
+}  // namespace fs_mgr
+}  // namespace android

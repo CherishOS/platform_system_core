@@ -12,6 +12,7 @@ cc_defaults {
         "-Wno-unused-argument",
         "-Wno-unused-function",
         "-Wno-nullability-completeness",
+        "-Wno-reorder-init-list",
         "-Os",
         "-fno-finite-loops",
         "-DANDROID_DEBUGGABLE=0",
@@ -185,9 +186,45 @@ cc_library {
     export_include_dirs: ["include"],
 }
 
+cc_library {
+    name: "libdebuggerd_tombstone_proto_to_text",
+    defaults: ["debuggerd_defaults"],
+    ramdisk_available: true,
+    recovery_available: true,
+    vendor_ramdisk_available: true,
+
+    local_include_dirs: ["libdebuggerd/include"],
+    export_include_dirs: ["libdebuggerd/include"],
+
+    srcs: [
+        "libdebuggerd/tombstone_proto_to_text.cpp",
+    ],
+
+    header_libs: [
+        "bionic_libc_platform_headers",
+    ],
+
+    static_libs: [
+        "libbase",
+        "liblog_for_runtime_apex",
+        "libunwindstack",
+    ],
+
+    whole_static_libs: [
+        "libtombstone_proto",
+        "libprotobuf-cpp-lite",
+    ],
+
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.runtime",
+    ],
+}
+
 cc_library_static {
     name: "libdebuggerd",
     defaults: ["debuggerd_defaults"],
+    ramdisk_available: true,
     recovery_available: true,
     vendor_ramdisk_available: true,
 
@@ -197,7 +234,6 @@ cc_library_static {
         "libdebuggerd/open_files_list.cpp",
         "libdebuggerd/tombstone.cpp",
         "libdebuggerd/tombstone_proto.cpp",
-        "libdebuggerd/tombstone_proto_to_text.cpp",
         "libdebuggerd/utility.cpp",
     ],
 
@@ -221,11 +257,9 @@ cc_library_static {
         "libbase",
         "libcutils",
     ],
-    runtime_libs: [
-        "libdexfile",           // libdexfile_support dependency
-    ],
 
     whole_static_libs: [
+        "libdebuggerd_tombstone_proto_to_text",
         "libasync_safe",
         "gwp_asan_crash_handler",
         "libtombstone_proto",
@@ -248,6 +282,19 @@ cc_library_static {
             ],
             exclude_runtime_libs: [
                 "libdexfile",
+            ],
+        },
+        ramdisk: {
+            exclude_static_libs: [
+                "libdexfile_support",
+            ],
+            exclude_runtime_libs: [
+                "libdexfile",
+            ],
+        },
+        android: {
+            runtime_libs: [
+                "libdexfile",           // libdexfile_support dependency
             ],
         },
     },
@@ -290,7 +337,7 @@ cc_test {
         "libdebuggerd/test/elf_fake.cpp",
         "libdebuggerd/test/log_fake.cpp",
         "libdebuggerd/test/open_files_list_test.cpp",
-        "libdebuggerd/test/utility_test.cpp",
+        "libdebuggerd/test/tombstone_proto_to_text_test.cpp",
     ],
 
     target: {
