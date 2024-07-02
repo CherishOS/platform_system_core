@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -429,7 +430,7 @@ TEST_P(CompressionTest, NoBatchWrites) {
 template <typename T>
 class HorribleStream : public IByteStream {
   public:
-    HorribleStream(const std::basic_string<T>& input) : input_(input) {}
+    HorribleStream(const std::vector<T>& input) : input_(input) {}
 
     ssize_t Read(void* buffer, size_t length) override {
         if (pos_ >= input_.size()) {
@@ -444,16 +445,17 @@ class HorribleStream : public IByteStream {
     size_t Size() const override { return input_.size(); }
 
   private:
-    std::basic_string<T> input_;
+    std::vector<T> input_;
     size_t pos_ = 0;
 };
 
 TEST(HorribleStream, ReadFully) {
-    std::string expected = "this is some data";
+    std::string expected_str = "this is some data";
+    std::vector<char> expected{expected_str.begin(), expected_str.end()};
 
     HorribleStream<char> stream(expected);
 
-    std::string buffer(expected.size(), '\0');
+    std::vector<char> buffer(expected.size(), '\0');
     ASSERT_TRUE(stream.ReadFully(buffer.data(), buffer.size()));
     ASSERT_EQ(buffer, expected);
 }
@@ -601,14 +603,14 @@ TEST_F(CowTest, GetSize) {
     ASSERT_TRUE(writer.AddCopy(10, 20));
     ASSERT_TRUE(writer.AddRawBlocks(50, data.data(), data.size()));
     ASSERT_TRUE(writer.AddZeroBlocks(51, 2));
-    auto size_before = writer.GetCowSize();
+    auto size_before = writer.GetCowSizeInfo().cow_size;
     ASSERT_TRUE(writer.Finalize());
-    auto size_after = writer.GetCowSize();
+    auto size_after = writer.GetCowSizeInfo().cow_size;
     ASSERT_EQ(size_before, size_after);
     struct stat buf;
 
     ASSERT_GE(fstat(cow_->fd, &buf), 0) << strerror(errno);
-    ASSERT_EQ(buf.st_size, writer.GetCowSize());
+    ASSERT_EQ(buf.st_size, writer.GetCowSizeInfo().cow_size);
 }
 
 TEST_F(CowTest, AppendLabelSmall) {
@@ -637,7 +639,7 @@ TEST_F(CowTest, AppendLabelSmall) {
 
     struct stat buf;
     ASSERT_EQ(fstat(cow_->fd, &buf), 0);
-    ASSERT_EQ(buf.st_size, writer->GetCowSize());
+    ASSERT_EQ(buf.st_size, writer->GetCowSizeInfo().cow_size);
 
     // Read back both operations, and label.
     CowReader reader;
@@ -690,7 +692,7 @@ TEST_F(CowTest, AppendLabelMissing) {
     ASSERT_TRUE(writer->AddRawBlocks(50, data.data(), data.size()));
     ASSERT_TRUE(writer->AddLabel(1));
     // Drop the tail end of the last op header, corrupting it.
-    ftruncate(cow_->fd, writer->GetCowSize() - sizeof(CowFooter) - 3);
+    ftruncate(cow_->fd, writer->GetCowSizeInfo().cow_size - sizeof(CowFooter) - 3);
 
     ASSERT_EQ(lseek(cow_->fd, 0, SEEK_SET), 0);
 
@@ -705,7 +707,7 @@ TEST_F(CowTest, AppendLabelMissing) {
 
     struct stat buf;
     ASSERT_EQ(fstat(cow_->fd, &buf), 0);
-    ASSERT_EQ(buf.st_size, writer->GetCowSize());
+    ASSERT_EQ(buf.st_size, writer->GetCowSizeInfo().cow_size);
 
     // Read back both operations.
     CowReader reader;
@@ -763,7 +765,7 @@ TEST_F(CowTest, AppendExtendedCorrupted) {
 
     struct stat buf;
     ASSERT_EQ(fstat(cow_->fd, &buf), 0);
-    ASSERT_EQ(buf.st_size, writer->GetCowSize());
+    ASSERT_EQ(buf.st_size, writer->GetCowSizeInfo().cow_size);
 
     // Read back all valid operations
     CowReader reader;
@@ -812,7 +814,7 @@ TEST_F(CowTest, AppendbyLabel) {
 
     struct stat buf;
     ASSERT_EQ(fstat(cow_->fd, &buf), 0);
-    ASSERT_EQ(buf.st_size, writer->GetCowSize());
+    ASSERT_EQ(buf.st_size, writer->GetCowSizeInfo().cow_size);
 
     // Read back all ops
     CowReader reader;
@@ -989,7 +991,7 @@ TEST_F(CowTest, ClusterAppendTest) {
 
     struct stat buf;
     ASSERT_EQ(fstat(cow_->fd, &buf), 0);
-    ASSERT_EQ(buf.st_size, writer->GetCowSize());
+    ASSERT_EQ(buf.st_size, writer->GetCowSizeInfo().cow_size);
 
     // Read back both operations, plus cluster op at end
     CowReader reader;

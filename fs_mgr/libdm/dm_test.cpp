@@ -181,6 +181,13 @@ TEST_F(DmTest, DmSuspendResume) {
     ASSERT_EQ(dm.GetState(dev.name()), DmDeviceState::ACTIVE);
 }
 
+TEST_F(DmTest, StripeArgs) {
+    DmTargetStripe target(0, 4096, 1024, "/dev/loop0", "/dev/loop1");
+    ASSERT_EQ(target.name(), "striped");
+    ASSERT_TRUE(target.Valid());
+    ASSERT_EQ(target.GetParameterString(), "2 1024 /dev/loop0 0 /dev/loop1 0");
+}
+
 TEST_F(DmTest, DmVerityArgsAvb2) {
     std::string device = "/dev/block/platform/soc/1da4000.ufshc/by-name/vendor_a";
     std::string algorithm = "sha1";
@@ -580,9 +587,18 @@ TEST_F(DmTest, DeleteDeviceWithTimeout) {
     ASSERT_TRUE(dm.GetDmDevicePathByName("libdm-test-dm-linear", &path));
     ASSERT_EQ(0, access(path.c_str(), F_OK));
 
+    std::string unique_path;
+    ASSERT_TRUE(dm.GetDeviceUniquePath("libdm-test-dm-linear", &unique_path));
+    ASSERT_EQ(0, access(unique_path.c_str(), F_OK));
+
     ASSERT_TRUE(dm.DeleteDevice("libdm-test-dm-linear", 5s));
     ASSERT_EQ(DmDeviceState::INVALID, dm.GetState("libdm-test-dm-linear"));
-    ASSERT_NE(0, access(path.c_str(), F_OK));
+    // Check that unique path of this device has been deleteted.
+    // Previously this test case used to check that dev node (i.e. /dev/block/dm-XX) has been
+    // deleted. However, this introduces a race condition, ueventd will remove the unique symlink
+    // (i.e. /dev/block/mapper/by-uuid/...) **before** removing the device node, while DeleteDevice
+    // API synchronizes on the unique symlink being deleted.
+    ASSERT_NE(0, access(unique_path.c_str(), F_OK));
     ASSERT_EQ(ENOENT, errno);
 }
 

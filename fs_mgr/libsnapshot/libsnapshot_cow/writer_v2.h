@@ -27,7 +27,7 @@ class CowWriterV2 : public CowWriterBase {
 
     bool Initialize(std::optional<uint64_t> label = {}) override;
     bool Finalize() override;
-    uint64_t GetCowSize() override;
+    CowSizeInfo GetCowSizeInfo() const override;
 
   protected:
     virtual bool EmitCopy(uint64_t new_block, uint64_t old_block, uint64_t num_blocks = 1) override;
@@ -81,8 +81,8 @@ class CowWriterV2 : public CowWriterBase {
     int num_compress_threads_ = 1;
     std::vector<std::unique_ptr<CompressWorker>> compress_threads_;
     std::vector<std::future<bool>> threads_;
-    std::vector<std::basic_string<uint8_t>> compressed_buf_;
-    std::vector<std::basic_string<uint8_t>>::iterator buf_iter_;
+    std::vector<std::vector<uint8_t>> compressed_buf_;
+    std::vector<std::vector<uint8_t>>::iterator buf_iter_;
 
     std::vector<std::unique_ptr<CowOperationV2>> opbuffer_vec_;
     std::vector<std::unique_ptr<uint8_t[]>> databuffer_vec_;

@@ -37,6 +37,7 @@
 #include <string>
 #include <thread>
 
+#include <android/crash_detail.h>
 #include <android/dlext.h>
 #include <android/fdsan.h>
 #include <android/set_abort_message.h>
@@ -937,6 +938,233 @@ TEST_F(CrasherTest, abort_message) {
   std::string result;
   ConsumeFd(std::move(output_fd), &result);
   ASSERT_MATCH(result, R"(Abort message: 'x{4045}')");
+}
+
+static char g_crash_detail_value_changes[] = "crash_detail_value";
+static char g_crash_detail_value[] = "crash_detail_value";
+static char g_crash_detail_value2[] = "crash_detail_value2";
+
+inline crash_detail_t* _Nullable android_register_crash_detail_strs(const char* _Nonnull name,
+                                                                    const char* _Nonnull data) {
+  return android_crash_detail_register(name, strlen(name), data, strlen(data));
+}
+
+TEST_F(CrasherTest, crash_detail_single) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME", g_crash_detail_value);
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME: 'crash_detail_value')");
+}
+
+TEST_F(CrasherTest, crash_detail_replace_data) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    auto *cd = android_register_crash_detail_strs("CRASH_DETAIL_NAME", "original_data");
+    android_crash_detail_replace_data(cd, "new_data", strlen("new_data"));
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME: 'new_data')");
+  // Ensure the old one no longer shows up, i.e. that we actually replaced
+  // it, not added a new one.
+  ASSERT_NOT_MATCH(result, R"(CRASH_DETAIL_NAME: 'original_data')");
+}
+
+TEST_F(CrasherTest, crash_detail_replace_name) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    auto *cd = android_register_crash_detail_strs("old_name", g_crash_detail_value);
+    android_crash_detail_replace_name(cd, "new_name", strlen("new_name"));
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(new_name: 'crash_detail_value')");
+  // Ensure the old one no longer shows up, i.e. that we actually replaced
+  // it, not added a new one.
+  ASSERT_NOT_MATCH(result, R"(old_name: 'crash_detail_value')");
+}
+
+TEST_F(CrasherTest, crash_detail_single_byte_name) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME\1", g_crash_detail_value);
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME\\1: 'crash_detail_value')");
+}
+
+
+TEST_F(CrasherTest, crash_detail_single_bytes) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    android_crash_detail_register("CRASH_DETAIL_NAME", strlen("CRASH_DETAIL_NAME"), "\1",
+                                  sizeof("\1"));
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME: '\\1\\0')");
+}
+
+TEST_F(CrasherTest, crash_detail_mixed) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    const char data[] = "helloworld\1\255\3";
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME", data);
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME: 'helloworld\\1\\255\\3')");
+}
+
+TEST_F(CrasherTest, crash_detail_many) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    for (int i = 0; i < 1000; ++i) {
+      std::string name = "CRASH_DETAIL_NAME" + std::to_string(i);
+      std::string value = "CRASH_DETAIL_VALUE" + std::to_string(i);
+      auto* h = android_register_crash_detail_strs(name.data(), value.data());
+      android_crash_detail_unregister(h);
+    }
+
+    android_register_crash_detail_strs("FINAL_NAME", "FINAL_VALUE");
+    android_register_crash_detail_strs("FINAL_NAME2", "FINAL_VALUE2");
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_NOT_MATCH(result, "CRASH_DETAIL_NAME");
+  ASSERT_NOT_MATCH(result, "CRASH_DETAIL_VALUE");
+  ASSERT_MATCH(result, R"(FINAL_NAME: 'FINAL_VALUE')");
+  ASSERT_MATCH(result, R"(FINAL_NAME2: 'FINAL_VALUE2')");
+}
+
+TEST_F(CrasherTest, crash_detail_single_changes) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME", g_crash_detail_value_changes);
+    g_crash_detail_value_changes[0] = 'C';
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME: 'Crash_detail_value')");
+}
+
+TEST_F(CrasherTest, crash_detail_multiple) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME", g_crash_detail_value);
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME2", g_crash_detail_value2);
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME: 'crash_detail_value')");
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME2: 'crash_detail_value2')");
+}
+
+TEST_F(CrasherTest, crash_detail_remove) {
+  int intercept_result;
+  unique_fd output_fd;
+  StartProcess([]() {
+    auto* detail1 = android_register_crash_detail_strs("CRASH_DETAIL_NAME", g_crash_detail_value);
+    android_crash_detail_unregister(detail1);
+    android_register_crash_detail_strs("CRASH_DETAIL_NAME2", g_crash_detail_value2);
+    abort();
+  });
+  StartIntercept(&output_fd);
+  FinishCrasher();
+  AssertDeath(SIGABRT);
+  FinishIntercept(&intercept_result);
+
+  ASSERT_EQ(1, intercept_result) << "tombstoned reported failure";
+
+  std::string result;
+  ConsumeFd(std::move(output_fd), &result);
+  ASSERT_NOT_MATCH(result, R"(CRASH_DETAIL_NAME: 'crash_detail_value')");
+  ASSERT_MATCH(result, R"(CRASH_DETAIL_NAME2: 'crash_detail_value2')");
 }
 
 TEST_F(CrasherTest, abort_message_newline_trimmed) {
@@ -2221,28 +2449,10 @@ TEST_F(CrasherTest, unreadable_elf) {
   ASSERT_MATCH(result, match_str);
 }
 
-TEST(tombstoned, proto) {
-  const pid_t self = getpid();
-  unique_fd tombstoned_socket, text_fd, proto_fd;
-  ASSERT_TRUE(
-      tombstoned_connect(self, &tombstoned_socket, &text_fd, &proto_fd, kDebuggerdTombstoneProto));
-
-  tombstoned_notify_completion(tombstoned_socket.get());
-
-  ASSERT_NE(-1, text_fd.get());
-  ASSERT_NE(-1, proto_fd.get());
-
-  struct stat text_st;
-  ASSERT_EQ(0, fstat(text_fd.get(), &text_st));
-
-  // Give tombstoned some time to link the files into place.
-  std::this_thread::sleep_for(100ms);
-
-  // Find the tombstone.
-  std::optional<std::string> tombstone_file;
+void CheckForTombstone(const struct stat& text_st, std::optional<std::string>& tombstone_file) {
+  static std::regex tombstone_re("tombstone_\\d+");
   std::unique_ptr<DIR, decltype(&closedir)> dir_h(opendir("/data/tombstones"), closedir);
   ASSERT_TRUE(dir_h != nullptr);
-  std::regex tombstone_re("tombstone_\\d+");
   dirent* entry;
   while ((entry = readdir(dir_h.get())) != nullptr) {
     if (!std::regex_match(entry->d_name, tombstone_re)) {
@@ -2260,8 +2470,38 @@ TEST(tombstoned, proto) {
       break;
     }
   }
+}
 
-  ASSERT_TRUE(tombstone_file);
+TEST(tombstoned, proto) {
+  const pid_t self = getpid();
+  unique_fd tombstoned_socket, text_fd, proto_fd;
+  ASSERT_TRUE(
+      tombstoned_connect(self, &tombstoned_socket, &text_fd, &proto_fd, kDebuggerdTombstoneProto));
+
+  tombstoned_notify_completion(tombstoned_socket.get());
+
+  ASSERT_NE(-1, text_fd.get());
+  ASSERT_NE(-1, proto_fd.get());
+
+  struct stat text_st;
+  ASSERT_EQ(0, fstat(text_fd.get(), &text_st));
+
+  std::optional<std::string> tombstone_file;
+  // Allow up to 5 seconds for the tombstone to be written to the system.
+  const auto max_wait_time = std::chrono::seconds(5) * android::base::HwTimeoutMultiplier();
+  const auto start = std::chrono::high_resolution_clock::now();
+  while (true) {
+    std::this_thread::sleep_for(100ms);
+    CheckForTombstone(text_st, tombstone_file);
+    if (tombstone_file) {
+      break;
+    }
+    if (std::chrono::high_resolution_clock::now() - start > max_wait_time) {
+      break;
+    }
+  }
+
+  ASSERT_TRUE(tombstone_file) << "Timed out trying to find tombstone file.";
   std::string proto_path = tombstone_file.value() + ".pb";
 
   struct stat proto_fd_st;
@@ -2407,7 +2647,7 @@ TEST_F(CrasherTest, fault_address_after_last_map) {
   match_str += format_full_pointer(crash_uptr);
   ASSERT_MATCH(result, match_str);
 
-  ASSERT_MATCH(result, R"(\nmemory map \(.*\): \(fault address prefixed with --->)\n)");
+  ASSERT_MATCH(result, R"(\nmemory map \(.*\): \(fault address prefixed with --->\)\n)");
 
   // Verifies that the fault address error message is at the end of the
   // maps section. To do this, the check below looks for the start of the
@@ -2459,7 +2699,7 @@ TEST_F(CrasherTest, fault_address_between_maps) {
   match_str += format_full_pointer(reinterpret_cast<uintptr_t>(middle_ptr));
   ASSERT_MATCH(result, match_str);
 
-  ASSERT_MATCH(result, R"(\nmemory map \(.*\): \(fault address prefixed with --->)\n)");
+  ASSERT_MATCH(result, R"(\nmemory map \(.*\): \(fault address prefixed with --->\)\n)");
 
   match_str = android::base::StringPrintf(
       R"(    %s.*\n--->Fault address falls at %s between mapped regions\n    %s)",
@@ -2497,7 +2737,7 @@ TEST_F(CrasherTest, fault_address_in_map) {
   match_str += format_full_pointer(reinterpret_cast<uintptr_t>(ptr));
   ASSERT_MATCH(result, match_str);
 
-  ASSERT_MATCH(result, R"(\nmemory map \(.*\): \(fault address prefixed with --->)\n)");
+  ASSERT_MATCH(result, R"(\nmemory map \(.*\): \(fault address prefixed with --->\)\n)");
 
   match_str = android::base::StringPrintf(R"(\n--->%s.*\n)", format_pointer(ptr).c_str());
   ASSERT_MATCH(result, match_str);

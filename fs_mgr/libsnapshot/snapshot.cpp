@@ -420,6 +420,7 @@ bool SnapshotManager::CreateSnapshot(LockedFile* lock, PartitionCowCreator* cow_
     status->set_metadata_sectors(0);
     status->set_using_snapuserd(cow_creator->using_snapuserd);
     status->set_compression_algorithm(cow_creator->compression_algorithm);
+    status->set_compression_factor(cow_creator->compression_factor);
     if (cow_creator->enable_threading) {
         status->set_enable_threading(cow_creator->enable_threading);
     }
@@ -507,8 +508,6 @@ bool SnapshotManager::MapDmUserCow(LockedFile* lock, const std::string& name,
         // When snapshots are on current slot, we determine the size
         // of block device based on the number of COW operations. We cannot
         // use base device as it will be from older image.
-        size_t num_ops = 0;
-        uint64_t dev_sz = 0;
         unique_fd fd(open(cow_file.c_str(), O_RDONLY | O_CLOEXEC));
         if (fd < 0) {
             PLOG(ERROR) << "Failed to open " << cow_file;
@@ -521,13 +520,18 @@ bool SnapshotManager::MapDmUserCow(LockedFile* lock, const std::string& name,
             return false;
         }
 
+        uint64_t dev_sz = 0;
         const auto& header = reader.GetHeader();
-        if (header.prefix.major_version > 2) {
-            LOG(ERROR) << "COW format not supported";
-            return false;
+        if (header.prefix.major_version == 2) {
+            const size_t num_ops = reader.get_num_total_data_ops();
+            dev_sz = (num_ops * header.block_size);
+        } else {
+            // create_snapshot will skip in-place copy ops. Hence, fetch this
+            // information directly from v3 header.
+            const auto& v3_header = reader.header_v3();
+            dev_sz = v3_header.op_count_max * v3_header.block_size;
         }
-        num_ops = reader.get_num_total_data_ops();
-        dev_sz = (num_ops * header.block_size);
+
         base_sectors = dev_sz >> 9;
     } else {
         // For userspace snapshots, the size of the base device is taken as the
@@ -3233,12 +3237,16 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
     }
 
     std::string compression_algorithm;
+    uint64_t compression_factor{};
     if (using_snapuserd) {
         compression_algorithm = dap_metadata.vabc_compression_param();
+        compression_factor = dap_metadata.compression_factor();
         if (compression_algorithm.empty()) {
             // Older OTAs don't set an explicit compression type, so default to gz.
             compression_algorithm = "gz";
         }
+        LOG(INFO) << "using compression algorithm: " << compression_algorithm
+                   << ", max compressible block size: " << compression_factor;
     }
 
     PartitionCowCreator cow_creator{
@@ -3251,7 +3259,9 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
             .extra_extents = {},
             .using_snapuserd = using_snapuserd,
             .compression_algorithm = compression_algorithm,
+            .compression_factor = compression_factor,
     };
+
     if (dap_metadata.vabc_feature_set().has_threaded()) {
         cow_creator.enable_threading = dap_metadata.vabc_feature_set().threaded();
     }
@@ -3330,7 +3340,7 @@ Return SnapshotManager::CreateUpdateSnapshots(const DeltaArchiveManifest& manife
         // Terminate stale daemon if any
         std::unique_ptr<SnapuserdClient> snapuserd_client = std::move(snapuserd_client_);
         if (!snapuserd_client) {
-            snapuserd_client = SnapuserdClient::Connect(kSnapuserdSocket, 5s);
+            snapuserd_client = SnapuserdClient::TryConnect(kSnapuserdSocket, 5s);
         }
         if (snapuserd_client) {
             snapuserd_client->DetachSnapuserd();
@@ -3551,6 +3561,10 @@ Return SnapshotManager::InitializeUpdateSnapshots(
                 options.scratch_space = false;
             }
             options.compression = it->second.compression_algorithm();
+            if (cow_version >= 3) {
+                options.op_count_max = it->second.estimated_ops_buffer_size();
+                options.max_blocks = {it->second.device_size() / options.block_size};
+            }
 
             auto writer = CreateCowWriter(cow_version, options, std::move(fd));
             if (!writer->Finalize()) {
@@ -3661,10 +3675,9 @@ std::unique_ptr<ICowWriter> SnapshotManager::OpenCompressedSnapshotWriter(
     cow_options.compression = status.compression_algorithm();
     cow_options.max_blocks = {status.device_size() / cow_options.block_size};
     cow_options.batch_write = status.batched_writes();
-    cow_options.num_compress_threads = status.enable_threading() ? 2 : 0;
-    // TODO(b/313962438) Improve op_count estimate. For now, use number of
-    // blocks as an upper bound.
-    cow_options.op_count_max = status.device_size() / cow_options.block_size;
+    cow_options.num_compress_threads = status.enable_threading() ? 2 : 1;
+    cow_options.op_count_max = status.estimated_ops_buffer_size();
+    cow_options.compression_factor = status.compression_factor();
     // Disable scratch space for vts tests
     if (device()->IsTestDevice()) {
         cow_options.scratch_space = false;
@@ -3792,6 +3805,7 @@ bool SnapshotManager::Dump(std::ostream& os) {
         ss << "    allocated sectors: " << status.sectors_allocated() << std::endl;
         ss << "    metadata sectors: " << status.metadata_sectors() << std::endl;
         ss << "    compression: " << status.compression_algorithm() << std::endl;
+        ss << "    compression factor: " << status.compression_factor() << std::endl;
         ss << "    merge phase: " << DecideMergePhase(status) << std::endl;
     }
     os << ss.rdbuf();

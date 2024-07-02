@@ -104,6 +104,7 @@ std::string fake_super;
 
 void MountMetadata();
 
+// @VsrTest = 3.7.6
 class SnapshotTest : public ::testing::Test {
   public:
     SnapshotTest() : dm_(DeviceMapper::Instance()) {}
@@ -2864,15 +2865,23 @@ void SnapshotTestEnvironment::TearDown() {
 }
 
 void KillSnapuserd() {
-    auto status = android::base::GetProperty("init.svc.snapuserd", "stopped");
-    if (status == "stopped") {
-        return;
+    // Detach the daemon if it's alive
+    auto snapuserd_client = SnapuserdClient::TryConnect(kSnapuserdSocket, 5s);
+    if (snapuserd_client) {
+        snapuserd_client->DetachSnapuserd();
     }
-    auto snapuserd_client = SnapuserdClient::Connect(kSnapuserdSocket, 5s);
-    if (!snapuserd_client) {
-        return;
+
+    // Now stop the service - Init will send a SIGKILL to the daemon. However,
+    // process state will move from "running" to "stopping". Only after the
+    // process is reaped by init, the service state is moved to "stopped".
+    //
+    // Since the tests involve starting the daemon immediately, wait for the
+    // process to completely stop (aka. wait until init reaps the terminated
+    // process).
+    android::base::SetProperty("ctl.stop", "snapuserd");
+    if (!android::base::WaitForProperty("init.svc.snapuserd", "stopped", 10s)) {
+        LOG(ERROR) << "Timed out waiting for snapuserd to stop.";
     }
-    snapuserd_client->DetachSnapuserd();
 }
 
 }  // namespace snapshot
